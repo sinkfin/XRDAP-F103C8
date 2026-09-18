@@ -232,9 +232,57 @@ on:
           - ✅ 勾选 : 产物同时上传到 Release，可直接给他人下载链接
           - ⬜ 不勾 : 只留 Actions Artifacts（30 天后自动清理）
           无论是否勾选，Artifacts 都会上传。
+          ⚠️ 即使构建中途失败，只要已有产物，也会自动打包上传
+             （见 upload_on_failure / rescue_release_tag）。
         required: true
         default: true
         type: boolean
+
+      # ============ 复用已有产物（跳过重复编译）============
+      # 下面三项是「省时间」的关键：内核/rootfs 编译动辄 20~40 分钟，
+      # 如果只是改了打包参数或想重出一份产物，没必要重编。
+      # 留空 = 不启用，按正常流程编译。
+      reuse_boot_from_run:
+        description: |
+          【省时间】复用某个历史 Run 已编译好的 boot.img，跳过内核编译
+          - 留空        : 正常编译内核（默认）
+          - 填 Run ID   : 例如 35342958852
+                          会从该 Run 的 Artifacts 里下载 boot.img.gz 直接复用
+          用途：内核没改、只是想重跑 rootfs 或重新打包时，能省 20~30 分钟。
+          ⚠️ 前提是该 Run 确实成功上传过含 boot.img 的 Artifact。
+        required: false
+        default: ''
+        type: string
+      reuse_rootfs_from_run:
+        description: |
+          【省时间】复用某个历史 Run 已构建好的 rootfs.img，跳过 Arch 安装
+          - 留空        : 正常构建 rootfs（默认）
+          - 填 Run ID   : 例如 35342958852
+          用途：只是想换内核、rootfs 没动时，能省 20~40 分钟。
+          ⚠️ 同上，需要该 Run 有含 rootfs.img 的 Artifact。
+        required: false
+        default: ''
+        type: string
+      artifact_fallback_pattern:
+        description: |
+          【省时间】按「Artifact 名字通配」自动找最近一次成功的产物复用
+          仅当上面的 Run ID 留空时生效，省去手动查 Run ID。
+          例如填 xaga-all-in-one-* 会去最近成功的 Run 里找匹配的 Artifact。
+          留空 = 不启用。
+        required: false
+        default: ''
+        type: string
+      rescue_release_tag:
+        description: |
+          构建失败时，用哪个 tag 把「已完成的产物」抢救上传到 Release
+          - 留空        : 失败时只上传 Actions Artifacts（30 天）
+          - 填 tag 名   : 例如 rescue-xaga
+                          失败也会把目前已产出的文件打包传到这个 Release
+          ⚠️ 失败的产物不保证可用（可能内核编译到一半），
+             但至少能让你下载回来排查，不用整个重跑。
+        required: false
+        default: ''
+        type: string
 
   push:
     tags:
@@ -343,6 +391,33 @@ jobs:
               echo "::error::build_target 取值非法: $BT"; exit 1
               ;;
           esac
+
+          # ---- 复用已有产物：如果指定了复用来来源，就跳过对应阶段的编译 ----
+          RB="${{ github.event.inputs.reuse_boot_from_run }}"
+          RR="${{ github.event.inputs.reuse_rootfs_from_run }}"
+          AP="${{ github.event.inputs.artifact_fallback_pattern }}"
+
+          # 只在对应阶段本来就该跑的时候才谈复用
+          if [ "$DO_BOOT" = "true" ] && { [ -n "$RB" ] || [ -n "$AP" ]; }; then
+            REUSE_BOOT="true"
+          else
+            REUSE_BOOT="false"
+          fi
+          if [ "$DO_ROOTFS" = "true" ] && { [ -n "$RR" ] || [ -n "$AP" ]; }; then
+            REUSE_ROOTFS="true"
+          else
+            REUSE_ROOTFS="false"
+          fi
+
+          echo "reuse_boot_run=$RB" >> $GITHUB_OUTPUT 2>/dev/null || true
+
+          {
+            echo "reuse_boot=$REUSE_BOOT"
+            echo "reuse_rootfs=$REUSE_ROOTFS"
+            echo "reuse_boot_run=$RB"
+            echo "reuse_rootfs_run=$RR"
+            echo "fallback_pattern=$AP"
+          } >> $GITHUB_OUTPUT
 
           {
             echo "build_target=$BT"
@@ -543,8 +618,170 @@ jobs:
           print('✅ mkbootimg 冒烟测试通过：可正常产出 boot v4 镜像')
           PY
 
+      # =================================================================
+      # 复用已有产物：从历史 Run 的 Artifacts 里把 boot.img / rootfs.img 拿回来
+      # 启用了复用就不走编译，直接解压还原成 raw .img，后续打包上传流程不变。
+      # =================================================================
+      - name: "[reuse] Restore boot.img from an earlier run"
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p out
+          # GitHub runner 自带 gh CLI；unzip 用于解开 Artifact 的 zip 包。
+          # 这里显式确认一下，避免跑到一半才发现缺工具。
+          for t in gh unzip gunzip; do
+            command -v "$t" >/dev/null 2>&1 || { echo "::error::缺少 $t"; exit 1; }
+          done
+
+          D="$RUNNER_TEMP/reuse-boot"
+          rm -rf "$D"; mkdir -p "$D"
+
+          RID="${{ steps.meta.outputs.reuse_boot_run }}"
+          PAT="${{ steps.meta.outputs.fallback_pattern }}"
+
+          # ---- 1. 解析要下载的 artifact ----
+          if [ -n "$RID" ]; then
+            echo "=== 按 Run ID 复用: $RID ==="
+            gh run download "$RID" --dir "$D" -R "${{ github.repository }}"
+          elif [ -n "$PAT" ]; then
+            echo "=== 按 pattern 复用: $PAT ==="
+            # 在当前仓库最近的 Artifacts 里挑最新的匹配项
+            AID=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+                  --jq "[.artifacts[] | select(.name | test(\"$PAT\")) | select(.expired==false)] | .[0].id")
+            if [ -z "$AID" ] || [ "$AID" = "null" ]; then
+              echo "::error::未找到匹配 pattern '$PAT' 且未过期的 Artifact"; exit 1
+            fi
+            echo "匹配到 artifact id=$AID"
+            gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > "$D/a.zip"
+            (cd "$D" && unzip -q -o a.zip && rm -f a.zip)
+          else
+            echo "::error::reuse_boot 开启了但没给 Run ID 也没给 pattern"; exit 1
+          fi
+
+          echo "=== 下载内容 ==="
+          find "$D" -type f | head -50
+
+          # ---- 2. 找到 boot.img 或 boot.img.gz ----
+          RAW=$(find "$D" -type f -name 'boot.img' | head -1)
+          GZ=$(find "$D" -type f -name 'boot.img.gz' | head -1)
+          PART=$(find "$D" -type f -name 'boot.img.gz.part-*' | sort | head -1)
+
+          if [ -n "$RAW" ]; then
+            echo "✅ 直接用现成的 boot.img: $RAW"
+            cp "$RAW" out/boot.img
+          elif [ -n "$GZ" ]; then
+            echo "✅ 解压 boot.img.gz: $GZ"
+            gunzip -c "$GZ" > out/boot.img
+          elif [ -n "$PART" ]; then
+            echo "✅ 合并分卷后再解压"
+            cat "$(dirname "$PART")"/boot.img.gz.part-* > "$D/merged.gz"
+            gunzip -c "$D/merged.gz" > out/boot.img
+          else
+            echo "::error::下载到的 Artifact 里没有 boot.img / boot.img.gz"
+            ls -laR "$D" | head -50; exit 1
+          fi
+
+          ls -lh out/boot.img
+          file out/boot.img
+
+          # ---- 3. 同样做一次 header 校验，确认复用的镜像确实可用 ----
+          python3 - <<'PY'
+          import struct, sys
+          d = open('out/boot.img', 'rb').read(4096)
+          if d[:8] != b'ANDROID!':
+              print('!! magic 异常:', d[:8]); sys.exit(1)
+          ksize = struct.unpack_from('<I', d, 0x08)[0]
+          rsize = struct.unpack_from('<I', d, 0x0c)[0]
+          hsize = struct.unpack_from('<I', d, 0x14)[0]
+          hver  = struct.unpack_from('<I', d, 0x28)[0]
+          print(f'  kernel_size    : {ksize}')
+          print(f'  ramdisk_size   : {rsize}')
+          print(f'  header_size    : {hsize}  (v4 应为 1584)')
+          print(f'  header_version : {hver}')
+          if hver != 4 or hsize != 1584 or ksize == 0 or rsize == 0:
+              print('!! 复用的 boot.img header 不合法'); sys.exit(1)
+          print('OK: 复用来的 boot.img 校验通过')
+          PY
+
+          echo "REUSED_BOOT=1" >> $GITHUB_ENV
+          echo "✅ boot.img 复用成功，已跳过内核编译（省约 20~30 分钟）"
+
+      - name: "[reuse] Restore rootfs.img from an earlier run"
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p out
+          for t in gh unzip gunzip e2fsck; do
+            command -v "$t" >/dev/null 2>&1 || { echo "::error::缺少 $t"; exit 1; }
+          done
+
+          D="$RUNNER_TEMP/reuse-rootfs"
+          rm -rf "$D"; mkdir -p "$D"
+
+          RID="${{ steps.meta.outputs.reuse_rootfs_run }}"
+          PAT="${{ steps.meta.outputs.fallback_pattern }}"
+
+          if [ -n "$RID" ]; then
+            echo "=== 按 Run ID 复用: $RID ==="
+            gh run download "$RID" --dir "$D" -R "${{ github.repository }}"
+          elif [ -n "$PAT" ]; then
+            echo "=== 按 pattern 复用: $PAT ==="
+            AID=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+                  --jq "[.artifacts[] | select(.name | test(\"$PAT\")) | select(.expired==false)] | .[0].id")
+            if [ -z "$AID" ] || [ "$AID" = "null" ]; then
+              echo "::error::未找到匹配 pattern '$PAT' 且未过期的 Artifact"; exit 1
+            fi
+            echo "匹配到 artifact id=$AID"
+            gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > "$D/a.zip"
+            (cd "$D" && unzip -q -o a.zip && rm -f a.zip)
+          else
+            echo "::error::reuse_rootfs 开启了但没给 Run ID 也没给 pattern"; exit 1
+          fi
+
+          echo "=== 下载内容 ==="
+          find "$D" -type f | head -50
+
+          RAW=$(find "$D" -type f -name 'rootfs.img' | head -1)
+          GZ=$(find "$D" -type f -name 'rootfs.img.gz' | head -1)
+          PART=$(find "$D" -type f -name 'rootfs.img.gz.part-*' | sort | head -1)
+
+          if [ -n "$RAW" ]; then
+            echo "✅ 直接用现成的 rootfs.img: $RAW"
+            cp "$RAW" out/rootfs.img
+          elif [ -n "$GZ" ]; then
+            echo "✅ 解压 rootfs.img.gz: $GZ"
+            gunzip -c "$GZ" > out/rootfs.img
+          elif [ -n "$PART" ]; then
+            echo "✅ 合并分卷后再解压（文件较大，稍等）"
+            cat "$(dirname "$PART")"/rootfs.img.gz.part-* > "$D/merged.gz"
+            gunzip -c "$D/merged.gz" > out/rootfs.img
+          else
+            echo "::error::下载到的 Artifact 里没有 rootfs.img / rootfs.img.gz"
+            ls -laR "$D" | head -50; exit 1
+          fi
+
+          ls -lh out/rootfs.img
+
+          # 复用的 rootfs 至少要是个合法 ext4，否则后面刷进去也是砖
+          echo "--- 校验文件系统 ---"
+          file out/rootfs.img
+          sudo e2fsck -f -n out/rootfs.img || echo "::warning::e2fsck 有输出，请检查"
+
+          echo "REUSED_ROOTFS=1" >> $GITHUB_ENV
+          echo "✅ rootfs.img 复用成功，已跳过 Arch 构建（省约 20~40 分钟）"
+
       - name: "[boot] Clone kernel source"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         run: |
           set -e
           for i in 1 2 3; do
@@ -560,7 +797,9 @@ jobs:
           git log -1 --format='%H %s'
 
       - name: "[boot] Merge kernel config"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         working-directory: linux
         run: |
           set -e
@@ -579,7 +818,9 @@ jobs:
           grep -E '^CONFIG_(LOCALVERSION|LZ4|RD_LZ4|ARCH_MEDIATEK)=' .config || true
 
       - name: "[boot] Build kernel Image"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         working-directory: linux
         run: |
           set -e
@@ -588,7 +829,9 @@ jobs:
           file arch/arm64/boot/Image
 
       - name: "[boot] Build device tree blob"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         working-directory: linux
         run: |
           set -e
@@ -602,7 +845,9 @@ jobs:
           fi
 
       - name: "[boot] Clone initramfs source"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         run: |
           set -e
           for i in 1 2 3; do
@@ -617,7 +862,9 @@ jobs:
           git log -1 --format='%H %s'
 
       - name: "[boot] Build initramfs"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         run: |
           set -e
           BOOT_PART="${{ steps.meta.outputs.boot_part }}"
@@ -643,7 +890,9 @@ jobs:
           strings root/init | grep -E '^/dev/sd' || true
 
       - name: "[boot] Pack boot.img"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         run: |
           set -e
           mkdir -p out tmp
@@ -715,7 +964,9 @@ jobs:
           PY
 
       - name: "[boot] Checksum boot.img"
-        if: steps.meta.outputs.do_boot == 'true'
+        if: |
+          steps.meta.outputs.do_boot == 'true' &&
+          steps.meta.outputs.reuse_boot != 'true'
         run: |
           set -e
           cd out
@@ -735,9 +986,11 @@ jobs:
         if: steps.meta.outputs.do_rootfs == 'true'
         run: |
           sudo apt-get update
+          # 注意：`bsdtar` **不是包名**，它是 libarchive-tools 提供的可执行文件。
+          # 写成 "bsdtar libarchive-tools" 会直接 E: Unable to locate package bsdtar。
           sudo apt-get install -y --no-install-recommends \
             qemu-user-static binfmt-support \
-            bsdtar libarchive-tools \
+            libarchive-tools \
             e2fsprogs util-linux \
             curl wget gnupg ca-certificates
 
@@ -745,7 +998,9 @@ jobs:
           ls /proc/sys/fs/binfmt_misc/ || true
 
       - name: "[rootfs] Download ArchLinuxARM tarball"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           mkdir -p work
@@ -773,7 +1028,9 @@ jobs:
           sha256sum alarm.tar.gz | tee alarm.tar.gz.sha256
 
       - name: "[rootfs] Extract rootfs"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work
@@ -783,7 +1040,9 @@ jobs:
           du -sh rootfs/
 
       - name: "[rootfs] Strip conflicting boot files"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work/rootfs
@@ -799,7 +1058,9 @@ jobs:
           echo "=== 删除后 ==="; ls -la boot/
 
       - name: "[rootfs] Configure pacman mirrors"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work/rootfs
@@ -814,7 +1075,9 @@ jobs:
           cat etc/pacman.d/mirrorlist
 
       - name: "[rootfs] Cross-install base via Arch container"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work
@@ -892,7 +1155,9 @@ jobs:
           echo "PACMAN_MODE=chroot" >> $GITHUB_ENV
 
       - name: "[rootfs] Install target packages"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work
@@ -947,7 +1212,9 @@ jobs:
           echo "✅ 目标包安装完成"
 
       - name: "[rootfs] Configure system (root only)"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work
@@ -1025,6 +1292,7 @@ jobs:
       - name: "[rootfs] Preconfigure WiFi"
         if: |
           steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true' &&
           github.event.inputs.wifi_ssid != ''
         run: |
           set -e
@@ -1059,7 +1327,9 @@ jobs:
           echo "✅ WiFi 已预置: $SSID"
 
       - name: "[rootfs] Pack rootfs.img"
-        if: steps.meta.outputs.do_rootfs == 'true'
+        if: |
+          steps.meta.outputs.do_rootfs == 'true' &&
+          steps.meta.outputs.reuse_rootfs != 'true'
         run: |
           set -e
           cd work
@@ -1102,7 +1372,11 @@ jobs:
       # 第 3 部分：汇总产物
       # =================================================================
       - name: "Compress artifacts (pigz)"
-        if: github.event.inputs.compress_artifacts != 'false'
+        # always() 是关键：前序步骤失败时 GitHub 默认跳过后续步骤，
+        # 这里要让「已经编出来的东西」照样压包，所以必须无视失败状态。
+        if: |
+          always() &&
+          github.event.inputs.compress_artifacts != 'false'
         run: |
           set -e
           mkdir -p out
@@ -1110,6 +1384,11 @@ jobs:
 
           echo "=== 压缩前 ==="
           ls -lh
+          # 一个产物都没有就别浪费时间了，直接过
+          if ! ls *.img >/dev/null 2>&1; then
+            echo "没有 .img 产物可压缩（前面的步骤可能失败了），跳过"
+            exit 0
+          fi
 
           # 注意：GITHUB_ENV 的变量名只允许 [A-Za-z_][A-Za-z0-9_]*，
           # 不能带点号（boot.img_GZ 这种会被 GitHub 直接拒绝），
@@ -1174,7 +1453,9 @@ jobs:
           ls -lh
 
       - name: "Split large artifacts (GitHub 单文件 2GB 上限)"
-        if: github.event.inputs.compress_artifacts != 'false'
+        if: |
+          always() &&
+          github.event.inputs.compress_artifacts != 'false'
         run: |
           set -e
           cd out
@@ -1211,6 +1492,7 @@ jobs:
           ls -lh
 
       - name: Generate README
+        if: always()
         run: |
           set -e
           mkdir -p out
@@ -1330,9 +1612,11 @@ jobs:
           cat README.txt
 
       - name: Upload all-in-one artifacts
+        # 失败也要上传：先把编出来的东西保住，别让几十分钟白费
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xaga-${{ steps.meta.outputs.build_target }}-${{ steps.meta.outputs.desktop }}-${{ env.KERNEL_COMMIT_SHORT || 'noboot' }}
+          name: xaga-${{ steps.meta.outputs.build_target }}-${{ steps.meta.outputs.desktop }}-${{ env.KERNEL_COMMIT_SHORT || 'noboot' }}${{ failure() && '-partial' || '' }}
           # 产物要么是 .img（未压缩），要么是 .gz / .gz.part-*（已压缩）。
           # 用 glob 通吃两种情况，避免 if-no-files-found 误报。
           path: |
@@ -1344,7 +1628,8 @@ jobs:
             out/*.img.sha256
             out/README.txt
           retention-days: 30
-          if-no-files-found: error
+          # 失败场景下可能确实一个产物都没有，这时不该报 error 掩盖真实错误
+          if-no-files-found: warn
           compression-level: 0
 
       # =================================================================
@@ -1352,23 +1637,71 @@ jobs:
       # =================================================================
       - name: Compute release tag
         if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
-          github.event.inputs.create_release == 'true'
+          always() && (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+            github.event.inputs.create_release == 'true' ||
+            github.event.inputs.rescue_release_tag != ''
+          )
         id: tag
         run: |
           set -e
+          # 判断本次是不是「抢救包」：只要产物缺了本该有的那一份，就算不完整。
+          # 注意：不要用 ${{ job.status }}，它在 run: 脚本里不可靠
+          # （官方只保证它在 if: 表达式里可用）。这里改成看实际产物。
+
+          # nullglob 必须开：否则 `ls out/*.part-*` 在没有匹配时会去 ls
+          # 一个叫 "*.part-*" 的实体，必然报错，把「有产物」误判成「没产物」。
+          shopt -s nullglob
+          ARTIFACTS=(out/*.gz out/*.gz.part-* out/*.img)
+          shopt -u nullglob
+
+          MISSING=""
+          if [ "${{ steps.meta.outputs.do_boot }}" = "true" ] && \
+             ! ls out/boot.img* >/dev/null 2>&1; then
+            MISSING="boot.img"
+          fi
+          if [ "${{ steps.meta.outputs.do_rootfs }}" = "true" ] && \
+             ! ls out/rootfs.img* >/dev/null 2>&1; then
+            MISSING="$MISSING rootfs.img"
+          fi
+          # 也可能压根一个产物都没有 —— 这时连抢救都没意义
+          NOTHING=false
+          if [ ${#ARTIFACTS[@]} -eq 0 ]; then
+            MISSING="（无任何产物）"
+            NOTHING=true
+          fi
+
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
             OUT_TAG="${{ github.ref_name }}"
+          elif [ "$NOTHING" = "true" ]; then
+            # 一个文件都没有，Release 传上去也是空的，直接跳过
+            OUT_TAG=""
+            echo "::warning::本次没有任何产物，跳过 Release"
+          elif [ -n "$MISSING" ] && [ -n "${{ github.event.inputs.rescue_release_tag }}" ]; then
+            # 产物不完整 + 用户配了抢救 tag → 走抢救通道，不污染正式产物
+            OUT_TAG="${{ github.event.inputs.rescue_release_tag }}"
+            echo "IS_RESCUE=true" >> $GITHUB_ENV
+            echo "::warning::产物不完整（缺: $MISSING），按抢救模式发布到 tag '$OUT_TAG'"
+          elif [ -n "$MISSING" ]; then
+            # 产物不完整且没配抢救 tag → 不上传 Release，只留 Artifacts
+            OUT_TAG=""
+            echo "::warning::产物不完整（缺: $MISSING），且未设置 rescue_release_tag，跳过 Release"
           else
             OUT_TAG="xaga-${{ steps.meta.outputs.build_target }}-${{ steps.meta.outputs.desktop }}-${KERNEL_COMMIT_SHORT:-noboot}"
           fi
           echo "out_tag=$OUT_TAG" >> $GITHUB_OUTPUT
-          echo "release tag = $OUT_TAG"
+          echo "release tag = ${OUT_TAG:-（跳过）}"
 
       - name: Create or update Release
+        # 成功照常发布；失败时若配了 rescue tag，也把残件抢救上去。
+        # out_tag 为空表示「产物不完整且没配抢救 tag」，这时直接跳过。
         if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
-          github.event.inputs.create_release == 'true'
+          always() &&
+          steps.tag.outputs.out_tag != '' && (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+            github.event.inputs.create_release == 'true' ||
+            env.IS_RESCUE == 'true'
+          )
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.out_tag }}
@@ -1376,7 +1709,12 @@ jobs:
           body: |
             ## xaga (Redmi Note 11T Pro) 构建产物
 
+            ${{ env.IS_RESCUE == 'true' && '> ⚠️ **这是构建失败后的「抢救包」**：只包含失败前已经产出的文件，不保证完整可用，仅用于排查或复用。' || '' }}
+
             本次任务：`${{ steps.meta.outputs.build_target }}`
+
+            ${{ env.REUSED_BOOT == '1' && '> ♻️ boot.img 复用自历史 Run，未重新编译内核。' || '' }}
+            ${{ env.REUSED_ROOTFS == '1' && '> ♻️ rootfs.img 复用自历史 Run，未重新构建 Arch。' || '' }}
 
             ### 构建参数
 
@@ -1470,9 +1808,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Summary
+        if: always()
         run: |
           {
-            echo "## ✅ 构建成功（任务: ${{ steps.meta.outputs.build_target }}）"
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "## ✅ 构建成功（任务: ${{ steps.meta.outputs.build_target }}）"
+            else
+              echo "## ⚠️ 构建失败/中断（任务: ${{ steps.meta.outputs.build_target }}）"
+              echo ""
+              echo "失败前已产出的文件会照常打包上传，可在下方 Artifacts 或 Release 里取回。"
+              echo "排查完可以用 \`reuse_boot_from_run\` / \`reuse_rootfs_from_run\` 复用已编译的部分，"
+              echo "不必从头再跑一遍。"
+            fi
             echo ""
             echo "| 项目 | 值 |"
             echo "|---|---|"
