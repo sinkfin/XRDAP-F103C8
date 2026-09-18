@@ -411,6 +411,17 @@ jobs:
 
           echo "reuse_boot_run=$RB" >> $GITHUB_OUTPUT 2>/dev/null || true
 
+          # ---- 复用参数与 build_target 不匹配时给出明确警告 ----
+          # boot 和 rootfs 是两条独立链路，复用参数只有和本次要产出的东西
+          # 对应上才有意义。填错了会被上面的闸静默忽略，容易让人以为
+          # "我明明填了复用，怎么还在编译/怎么没生效"，所以这里点出来。
+          if [ "$DO_BOOT" != "true" ] && [ -n "$RB" ]; then
+            echo "::warning::build_target=$BT 不产出 boot.img，你填的 reuse_boot_from_run=$RB 已被忽略。只想省时间的话请改用 reuse_rootfs_from_run。"
+          fi
+          if [ "$DO_ROOTFS" != "true" ] && [ -n "$RR" ]; then
+            echo "::warning::build_target=$BT 不产出 rootfs.img，你填的 reuse_rootfs_from_run=$RR 已被忽略。只想省时间的话请改用 reuse_boot_from_run。"
+          fi
+
           # ---- 产物名后缀 ----
           # 注意：不能在 `with:` 的表达式里用 failure() / success()，
           # 它们属于 status check function，只在步骤级 `if:` 里可求值，
@@ -1116,16 +1127,37 @@ jobs:
           PKGCACHE="$PWD/pkgcache"
           mkdir -p "$PKGCACHE"
 
+          # ⚠️ 关键：pacman 的 RootDir 等路径必须写「容器内路径」。
+          # 下面的 `docker run -v "$PWD:/work"` 把宿主机的 work/ 挂到容器的 /work，
+          # 所以同一个目录在两个世界里路径不同：
+          #     宿主机 : $PWD/rootfs        （$PWD = .../work）
+          #     容器内 : /work/rootfs
+          # 若把宿主机的绝对路径原样写进 RootDir，容器里根本不存在该路径，pacman 会报：
+          #     error: 'failed to resolve path '.../work/rootfs' passed to 'RootDir':
+          #            No such file or directory
+          # 这正是之前失败的根因。所以这里一律用 /work/... 的容器内路径。
+          ROOT_IN_CT="/work/rootfs"
+          PKGCACHE_IN_CT="/work/pkgcache"
+
+          # MkdirAll 语义：pacman 要求 RootDir 及其 DBPath 目录预先存在，
+          # 否则会报 "could not find or read directory"。
+          # 不要依赖上游步骤「恰好」建过这个目录——那是一个跨步骤的隐式依赖，
+          # 一旦 Extract rootfs 被跳过（如复用）或顺序变动就会炸。
+          mkdir -p "$ROOT/var/lib/pacman" \
+                   "$ROOT/etc/pacman.d/gnupg" \
+                   "$ROOT/etc/pacman.d/hooks" \
+                   "$ROOT/var/log"
+
           # 用官方 Arch 容器的 pacman 直接向 arm64 root 装包，
           # 完全绕开 qemu 模拟（快一个数量级）
           cat > pacman-cross.conf <<EOF
           [options]
-          RootDir   = $ROOT
-          DBPath    = $ROOT/var/lib/pacman/
-          CacheDir  = $PKGCACHE/
-          LogFile   = $ROOT/var/log/pacman.log
-          GPGDir    = $ROOT/etc/pacman.d/gnupg/
-          HookDir   = $ROOT/etc/pacman.d/hooks/
+          RootDir   = $ROOT_IN_CT
+          DBPath    = $ROOT_IN_CT/var/lib/pacman/
+          CacheDir  = $PKGCACHE_IN_CT/
+          LogFile   = $ROOT_IN_CT/var/log/pacman.log
+          GPGDir    = $ROOT_IN_CT/etc/pacman.d/gnupg/
+          HookDir   = $ROOT_IN_CT/etc/pacman.d/hooks/
           Architecture = aarch64
           SigLevel  = Never
 
