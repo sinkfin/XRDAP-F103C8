@@ -593,8 +593,8 @@ jobs:
           D="$RUNNER_TEMP/mkboot-smoke"
           rm -rf "$D"; mkdir -p "$D"; cd "$D"
 
-          head -c 1048576 /dev/urandom > Image.gz
-          head -c 65536   /dev/urandom > ramdisk.lz4
+          head -c 1048576 /dev/urandom > Image.gz || { echo "::error::无法生成测试 Image"; exit 1; }
+          head -c 65536   /dev/urandom > ramdisk.lz4 || { echo "::error::无法生成测试 ramdisk"; exit 1; }
 
           mkbootimg \
             --kernel Image.gz \
@@ -670,7 +670,7 @@ jobs:
           fi
 
           echo "=== 下载内容 ==="
-          find "$D" -type f | head -50
+          find "$D" -type f | head -50 || true
 
           # ---- 2. 找到 boot.img 或 boot.img.gz ----
           RAW=$(find "$D" -type f -name 'boot.img' | head -1)
@@ -689,11 +689,11 @@ jobs:
             gunzip -c "$D/merged.gz" > out/boot.img
           else
             echo "::error::下载到的 Artifact 里没有 boot.img / boot.img.gz"
-            ls -laR "$D" | head -50; exit 1
+            ls -laR "$D" 2>/dev/null | head -50 || true; exit 1
           fi
 
-          ls -lh out/boot.img
-          file out/boot.img
+          ls -lh out/boot.img || true || true
+          file out/boot.img || true
 
           # ---- 3. 同样做一次 header 校验，确认复用的镜像确实可用 ----
           python3 - <<'PY'
@@ -754,7 +754,7 @@ jobs:
           fi
 
           echo "=== 下载内容 ==="
-          find "$D" -type f | head -50
+          find "$D" -type f | head -50 || true
 
           RAW=$(find "$D" -type f -name 'rootfs.img' | head -1)
           GZ=$(find "$D" -type f -name 'rootfs.img.gz' | head -1)
@@ -772,14 +772,14 @@ jobs:
             gunzip -c "$D/merged.gz" > out/rootfs.img
           else
             echo "::error::下载到的 Artifact 里没有 rootfs.img / rootfs.img.gz"
-            ls -laR "$D" | head -50; exit 1
+            ls -laR "$D" 2>/dev/null | head -50 || true; exit 1
           fi
 
-          ls -lh out/rootfs.img
+          ls -lh out/rootfs.img || true
 
           # 复用的 rootfs 至少要是个合法 ext4，否则后面刷进去也是砖
           echo "--- 校验文件系统 ---"
-          file out/rootfs.img
+          file out/rootfs.img || true
           sudo e2fsck -f -n out/rootfs.img || echo "::warning::e2fsck 有输出，请检查"
 
           echo "REUSED_ROOTFS=1" >> $GITHUB_ENV
@@ -832,8 +832,8 @@ jobs:
         run: |
           set -e
           make ARCH=arm64 LLVM=1 -j"$(nproc --all)" Image
-          ls -lh arch/arm64/boot/Image
-          file arch/arm64/boot/Image
+          ls -lh arch/arm64/boot/Image || true
+          file arch/arm64/boot/Image || true
 
       - name: "[boot] Build device tree blob"
         if: |
@@ -846,7 +846,7 @@ jobs:
             arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb || true
 
           if [ -f arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb ]; then
-            ls -lh arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb
+            ls -lh arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb || true
           else
             echo "::warning::未生成独立 dtb（DTB 已链入 Image，属正常）"
           fi
@@ -891,7 +891,7 @@ jobs:
             BOOT_PARTITION="$BOOT_PART" \
             EXTRA_CFLAGS="-DNVDATA_PARTITION=\\\"$NVDATA_PART\\\""
 
-          ls -lh initramfs.cpio.lz4 root/init
+          ls -lh initramfs.cpio.lz4 root/init || true
           aarch64-linux-gnu-readelf -h root/init | grep -E 'Machine|Type'
           echo "=== 确认分区宏已注入 ==="
           strings root/init | grep -E '^/dev/sd' || true
@@ -905,7 +905,7 @@ jobs:
           mkdir -p out tmp
 
           gzip -n -9 -c linux/arch/arm64/boot/Image > tmp/Image.gz
-          ls -lh tmp/Image.gz
+          ls -lh tmp/Image.gz || true
 
           # header_version 4 不接受 --dtb（DTB 已链入内核镜像）
           mkbootimg \
@@ -922,7 +922,7 @@ jobs:
             --os_patch_level  "$OS_PATCH_LEVEL" \
             -o out/boot.img
 
-          ls -lh out/boot.img
+          ls -lh out/boot.img || true
 
           echo "=== boot.img 头部校验 ==="
           python3 - <<'PY'
@@ -1020,7 +1020,7 @@ jobs:
             echo "第 $i 次失败，重试..."; sleep 15
           done
           test -s alarm.tar.gz || { echo "::error::下载失败"; exit 1; }
-          ls -lh alarm.tar.gz
+          ls -lh alarm.tar.gz || true
 
           echo "=== PGP 签名校验 ==="
           if wget -q -O alarm.tar.gz.sig "${TB}.sig"; then
@@ -1042,9 +1042,33 @@ jobs:
           set -e
           cd work
           mkdir -p rootfs
-          sudo bsdtar -xpf alarm.tar.gz -C rootfs
-          ls rootfs/
-          du -sh rootfs/
+
+          # ALARM tarball 里带着 0700 的目录（/root、/etc/ssl/private 等），
+          # 普通用户解不开、也统计不了。
+          # 关键：bsdtar 用 sudo，但 ls/du 只是「看一眼体积」的诊断命令，
+          # du 遇到读不了的目录会**按 1 退出**，配合 set -e 直接把整步打挂。
+          # 所以诊断命令一律 `|| true`，别让它们决定构建成败。
+          if ! sudo bsdtar -xpf alarm.tar.gz -C rootfs; then
+            echo "::error::rootfs 解包失败（tarball 损坏或磁盘空间不足？）"
+            df -h . || true
+            exit 1
+          fi
+
+          echo "=== 顶层目录 ==="
+          ls rootfs/ || true
+
+          echo "=== 体积（含不可读目录，仅供参考）==="
+          sudo du -sh rootfs/ 2>/dev/null || du -sh rootfs/ 2>/dev/null || true
+
+          echo "=== 关键目录存在性检查（这才是真正要断言的）==="
+          for d in bin etc usr var lib; do
+            if [ -e "rootfs/$d" ]; then
+              echo "  ✅ $d"
+            else
+              echo "  ❌ $d 缺失 —— tarball 可能不完整"
+              exit 1
+            fi
+          done
 
       - name: "[rootfs] Strip conflicting boot files"
         if: |
@@ -1369,7 +1393,7 @@ jobs:
           sudo umount mnt
 
           echo "=== 镜像信息 ==="
-          ls -lh "$IMG"; file "$IMG"
+          ls -lh "$IMG" || true; file "$IMG" || true
           echo "--- e2fsck ---"
           sudo e2fsck -f -n "$IMG" || echo "::warning::e2fsck 有输出，请检查"
 
@@ -1390,7 +1414,7 @@ jobs:
           cd out
 
           echo "=== 压缩前 ==="
-          ls -lh
+          ls -lh || true
           # 一个产物都没有就别浪费时间了，直接过
           # compgen -G 是真正的 glob 匹配，比 `ls *.img` 稳（后者依赖 ls 的退出码）
           if ! compgen -G '*.img' >/dev/null; then
@@ -1458,7 +1482,7 @@ jobs:
 
           echo ""
           echo "=== 压缩后 ==="
-          ls -lh
+          ls -lh || true
 
       - name: "Split large artifacts (GitHub 单文件 2GB 上限)"
         if: |
@@ -1481,7 +1505,7 @@ jobs:
               echo "大小: $(numfmt --to=iec $SIZE)"
               rm -f "$f".part-*
               split -b "$SPLIT_SIZE" -d -a 2 "$f" "$f.part-"
-              ls -lh "$f".part-*
+              ls -lh "$f".part-* || true
               echo "分卷数: $(ls "$f".part-* | wc -l)"
 
               # 分卷后原 .gz 不再单独上传（否则等于传两遍）
@@ -1497,7 +1521,7 @@ jobs:
 
           echo ""
           echo "=== 最终产物 ==="
-          ls -lh
+          ls -lh || true
 
       - name: Generate README
         if: always()
@@ -1594,7 +1618,7 @@ jobs:
           5. fastboot reboot
 
           --- 首次开机后扩容到全盘 ---
-          ls -l /dev/disk/by-partlabel/userdata
+          ls -l /dev/disk/by-partlabel/userdata || true
           resize2fs /dev/disk/by-partlabel/userdata
 
           --- 首次开机提示（desktop=none 时）---
@@ -1615,7 +1639,7 @@ jobs:
           EOF
 
           echo "=== 产物列表 ==="
-          ls -lh
+          ls -lh || true
           echo ""
           cat README.txt
 
@@ -1800,7 +1824,7 @@ jobs:
             ### 首次开机后扩容到全盘
 
             ```bash
-            ls -l /dev/disk/by-partlabel/userdata
+            ls -l /dev/disk/by-partlabel/userdata || true
             resize2fs /dev/disk/by-partlabel/userdata
             ```
 
