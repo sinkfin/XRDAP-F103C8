@@ -411,6 +411,13 @@ jobs:
 
           echo "reuse_boot_run=$RB" >> $GITHUB_OUTPUT 2>/dev/null || true
 
+          # ---- 产物名后缀 ----
+          # 注意：不能在 `with:` 的表达式里用 failure() / success()，
+          # 它们属于 status check function，只在步骤级 `if:` 里可求值，
+          # 写在 name: 里会直接报 "Unrecognized function: 'failure'"。
+          # 所以后缀在这里算好、写进 GITHUB_ENV，后面只读 env 值。
+          echo "ARTIFACT_SUFFIX=" >> $GITHUB_ENV
+
           {
             echo "reuse_boot=$REUSE_BOOT"
             echo "reuse_rootfs=$REUSE_ROOTFS"
@@ -1385,7 +1392,8 @@ jobs:
           echo "=== 压缩前 ==="
           ls -lh
           # 一个产物都没有就别浪费时间了，直接过
-          if ! ls *.img >/dev/null 2>&1; then
+          # compgen -G 是真正的 glob 匹配，比 `ls *.img` 稳（后者依赖 ls 的退出码）
+          if ! compgen -G '*.img' >/dev/null; then
             echo "没有 .img 产物可压缩（前面的步骤可能失败了），跳过"
             exit 0
           fi
@@ -1611,12 +1619,40 @@ jobs:
           echo ""
           cat README.txt
 
+      - name: Mark artifacts as partial if incomplete
+        # 必须在 with: 之外算——failure() 不能在 with: 表达式里用。
+        # 这里看实际产物判断，比看 job.status 更准。
+        if: always()
+        run: |
+          # 用 compgen -G 判断有无产物。
+          # 不要写 `ARTS=(out/boot.img)` 这种不含 glob 元字符的路径：
+          # bash 不对它做展开，nullglob 也不起作用，数组里永远是字面量，
+          # 会把「无产物」误判成「完整」。（out/boot.img* 带 * 才安全）
+          has() { compgen -G "$1" >/dev/null; }
+
+          MISSING=""
+          if [ "${{ steps.meta.outputs.do_boot }}" = "true" ] && ! has 'out/boot.img*'; then
+            MISSING="boot.img"
+          fi
+          if [ "${{ steps.meta.outputs.do_rootfs }}" = "true" ] && ! has 'out/rootfs.img*'; then
+            MISSING="$MISSING rootfs.img"
+          fi
+
+          if [ -n "$MISSING" ]; then
+            echo "ARTIFACT_SUFFIX=-partial" >> $GITHUB_ENV
+            echo "::warning::产物不完整（缺:$MISSING），Artifact 名加 -partial 后缀"
+          else
+            echo "ARTIFACT_SUFFIX=" >> $GITHUB_ENV
+            echo "产物完整"
+          fi
+
       - name: Upload all-in-one artifacts
         # 失败也要上传：先把编出来的东西保住，别让几十分钟白费
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xaga-${{ steps.meta.outputs.build_target }}-${{ steps.meta.outputs.desktop }}-${{ env.KERNEL_COMMIT_SHORT || 'noboot' }}${{ failure() && '-partial' || '' }}
+          # 后缀由前面的步骤算好写进 GITHUB_ENV（-partial 表示产物不完整）
+          name: xaga-${{ steps.meta.outputs.build_target }}-${{ steps.meta.outputs.desktop }}-${{ env.KERNEL_COMMIT_SHORT || 'noboot' }}${{ env.ARTIFACT_SUFFIX }}
           # 产物要么是 .img（未压缩），要么是 .gz / .gz.part-*（已压缩）。
           # 用 glob 通吃两种情况，避免 if-no-files-found 误报。
           path: |
@@ -1649,24 +1685,21 @@ jobs:
           # 注意：不要用 ${{ job.status }}，它在 run: 脚本里不可靠
           # （官方只保证它在 if: 表达式里可用）。这里改成看实际产物。
 
-          # nullglob 必须开：否则 `ls out/*.part-*` 在没有匹配时会去 ls
-          # 一个叫 "*.part-*" 的实体，必然报错，把「有产物」误判成「没产物」。
-          shopt -s nullglob
-          ARTIFACTS=(out/*.gz out/*.gz.part-* out/*.img)
-          shopt -u nullglob
+          # 用 compgen -G 做真正的 glob 匹配（无匹配返回非 0）。
+          # 不要写成 `ls out/*.part-*`：无匹配时它会去 ls 一个叫 "*.part-*"
+          # 的字面路径而报错，把「有产物」误判成「没产物」。
+          has() { compgen -G "$1" >/dev/null; }
 
           MISSING=""
-          if [ "${{ steps.meta.outputs.do_boot }}" = "true" ] && \
-             ! ls out/boot.img* >/dev/null 2>&1; then
+          if [ "${{ steps.meta.outputs.do_boot }}" = "true" ] && ! has 'out/boot.img*'; then
             MISSING="boot.img"
           fi
-          if [ "${{ steps.meta.outputs.do_rootfs }}" = "true" ] && \
-             ! ls out/rootfs.img* >/dev/null 2>&1; then
+          if [ "${{ steps.meta.outputs.do_rootfs }}" = "true" ] && ! has 'out/rootfs.img*'; then
             MISSING="$MISSING rootfs.img"
           fi
           # 也可能压根一个产物都没有 —— 这时连抢救都没意义
           NOTHING=false
-          if [ ${#ARTIFACTS[@]} -eq 0 ]; then
+          if ! has 'out/*.gz' && ! has 'out/*.img'; then
             MISSING="（无任何产物）"
             NOTHING=true
           fi
