@@ -1,10 +1,20 @@
 name: xrobot stm32 build test
 
 on:
-  push:
-    branches: ["main", "master"]
-  pull_request:
-    branches: ["main", "master"]
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "固件模式"
+        type: choice
+        default: all
+        options:
+          - all
+          - 72m
+          - 96m
+      upload_release:
+        description: "构建完成后发布 Release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,6 +51,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
 
+          # 根据下拉框选择决定构建哪些模式
+          if [ "${{ github.event.inputs.build_mode }}" = "all" ]; then
+            MODES="72m 96m"
+          else
+            MODES="${{ github.event.inputs.build_mode }}"
+          fi
+
           OBJCOPY_BIN=""
           if command -v starm-objcopy >/dev/null 2>&1; then
             OBJCOPY_BIN="starm-objcopy"
@@ -48,7 +65,7 @@ jobs:
             OBJCOPY_BIN="arm-none-eabi-objcopy"
           fi
 
-          for MODE in 72m 96m; do
+          for MODE in $MODES; do
             FW_DIR="build/XRDAP_F103C8_clock_${MODE}"
             ELF_PATH="${FW_DIR}/XRDAP-F103C8.elf"
             MAP_PATH="${FW_DIR}/XRDAP-F103C8.map"
@@ -91,7 +108,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: ${{ inputs.upload_release == true }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
